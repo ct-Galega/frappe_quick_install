@@ -3,18 +3,25 @@
 # frappe_install_v16.sh — Frappe / ERPNext v16 en Debian 13+ o Ubuntu 24.04+
 #
 # Uso (como usuario NORMAL con sudo, nunca como root, y SIN "source"):
-#   bash frappe_install_v16.sh
+#   bash frappe_install_v16.sh               # interactivo: menú y preguntas
+#   bash frappe_install_v16.sh install       # directo a la instalación base
+#   bash frappe_install_v16.sh production    # directo a configurar producción
+#   Sin terminal interactivo (cron, CI) no pregunta nada: usa las variables.
 #
 # Qué hace (sigue la guía oficial de instalación de Frappe para v16):
 #   MariaDB 11.8 (repo oficial firmado solo si la distro no la trae), Redis,
 #   wkhtmltopdf con Qt parcheado (checksum fijado), Node 24 (nvm), Python 3.14
-#   y bench (uv), bench init, sitio, ERPNext opcional y producción opcional
-#   (nginx + supervisor + fail2ban + SSL con Let's Encrypt).
+#   y bench (uv), deja bench/nvm en el PATH de futuras sesiones, bench init y
+#   crea el sitio. Siempre deja instalado lo necesario para producción
+#   (nginx, supervisor, fail2ban, ansible-core, certbot, acl); configurarlo
+#   es opcional, ahora o después con el modo "production".
 #
-# Variables opcionales (se preguntan si no están definidas):
-#   BENCH_NAME  SITE_NAME  FRAPPE_BRANCH (version-16)  INSTALL_ERPNEXT=yes|no
-#   SETUP_PRODUCTION=yes|no  SETUP_SSL=yes|no  FRAPPE_DB_ROOT_PASSWORD
-#   ALLOW_UNSUPPORTED=1   (continuar en una distro/versión no probada)
+# Se pregunta (si la variable no está definida): BENCH_NAME, SITE_NAME, la
+# contraseña (FRAPPE_DB_ROOT_PASSWORD), INSTALL_ERPNEXT, SETUP_PRODUCTION y
+# SETUP_SSL (yes/no; por defecto "no"), y se pide confirmación final.
+# Para saltarse preguntas, define la variable; ASSUME_YES=1 omite la confirmación.
+# Otras variables:
+#   FRAPPE_BRANCH (version-16)   ALLOW_UNSUPPORTED=1 (distro/versión no probada)
 #
 # Contraseñas: la de root de MariaDB se pide aquí (oculta) y se pasa a MariaDB
 # por stdin, nunca por la línea de comandos. La del Administrator del sitio y
@@ -79,26 +86,47 @@ trap cleanup EXIT
 ask() { # ask VAR "pregunta" [defecto]
     local __var=$1 prompt=$2 default=${3:-} reply
     [[ -n "${!__var:-}" ]] && return 0
-    read -rp "${prompt}${default:+ [$default]}: " reply
+    if [[ ! -t 0 ]]; then
+        [[ -n "$default" ]] || die "Falta ${__var} y no hay terminal interactivo: defínelo como variable de entorno."
+        printf -v "$__var" '%s' "$default"
+        return 0
+    fi
+    read -rp "${prompt}${default:+ [$default]}: " reply || reply=""
     printf -v "$__var" '%s' "${reply:-$default}"
 }
 
-yesno() { # yesno VAR "pregunta" y|n
-    local __var=$1 prompt=$2 default=${3:-n} reply hint
-    reply=${!__var:-}
-    if [[ -z "$reply" ]]; then
-        [[ "$default" == y ]] && hint="S/n" || hint="s/N"
-        read -rp "$prompt [$hint]: " reply
-        reply=${reply:-$default}
-    fi
-    case "${reply,,}" in
+flag() { # flag VAR : normaliza la variable a yes/no (sin preguntar; vacía = no)
+    local __var=$1 v
+    v=${!__var:-no}; v=${v,,}
+    case "$v" in
         y|yes|s|si|sí|1|true) printf -v "$__var" '%s' yes ;;
         *)                    printf -v "$__var" '%s' no ;;
     esac
 }
 
+# yesno VAR "pregunta" y|n : si VAR ya viene definida, la usa sin preguntar;
+# sin terminal interactivo toma el valor por defecto; si no, pregunta.
+yesno() {
+    local __var=$1 prompt=$2 default=${3:-n} reply hint
+    if [[ -n "${!__var:-}" ]]; then flag "$__var"; return 0; fi
+    if [[ ! -t 0 ]]; then printf -v "$__var" '%s' "$default"; flag "$__var"; return 0; fi
+    [[ $default == y ]] && hint="S/n" || hint="s/N"
+    read -rp "$prompt [$hint]: " reply || reply=""
+    printf -v "$__var" '%s' "${reply:-$default}"
+    flag "$__var"
+}
+
+# Pide confirmación antes de empezar (omitida sin terminal o con ASSUME_YES=1).
+confirm_go() {
+    [[ -t 0 && "${ASSUME_YES:-}" != 1 ]] || return 0
+    local go=""
+    yesno go "$1" y
+    [[ $go == yes ]] || { info "Cancelado. No se ha cambiado nada."; exit 0; }
+}
+
 read_secret_twice() { # read_secret_twice VAR "pregunta"
     local __var=$1 prompt=$2 a b
+    [[ -t 0 ]] || die "Hace falta un terminal interactivo para pedir la contraseña (o define FRAPPE_DB_ROOT_PASSWORD)."
     while true; do
         read -rsp "$prompt: " a; echo
         read -rsp "Repite la contraseña: " b; echo
@@ -152,19 +180,37 @@ preflight() {
 }
 
 # --- Datos de entrada ---------------------------------------------------------
+ask_bench_and_site() {
+    # En un terminal, si el nombre no es válido se vuelve a preguntar.
+    while true; do
+        ask BENCH_NAME "Nombre del bench (carpeta en tu home)" "frappe-bench"
+        [[ "$BENCH_NAME" =~ ^[A-Za-z0-9._-]+$ ]] && break
+        [[ -t 0 ]] || die "Nombre de bench no válido: solo letras, números, '.', '_' y '-'."
+        warn "Nombre de bench no válido: solo letras, números, '.', '_' y '-'."
+        BENCH_NAME=""
+    done
+
+    while true; do
+        ask SITE_NAME "Nombre del sitio (FQDN si vas a usar SSL, p. ej. erp.midominio.es)"
+        SITE_NAME=${SITE_NAME,,}
+        [[ "$SITE_NAME" =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$ ]] && break
+        [[ -t 0 ]] || die "Nombre de sitio no válido."
+        warn "Nombre de sitio no válido (solo letras, números, '.' y '-')."
+        SITE_NAME=""
+    done
+}
+
 collect_inputs() {
-    ask BENCH_NAME "Nombre del bench (carpeta en tu home)" "frappe-bench"
-    [[ "$BENCH_NAME" =~ ^[A-Za-z0-9._-]+$ ]] || die "Nombre de bench no válido: solo letras, números, '.', '_' y '-'."
+    ask_bench_and_site
 
-    ask SITE_NAME "Nombre del sitio (FQDN si vas a usar SSL, p. ej. erp.midominio.es)"
-    SITE_NAME=${SITE_NAME,,}
-    [[ "$SITE_NAME" =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$ ]] || die "Nombre de sitio no válido."
-
-    yesno INSTALL_ERPNEXT "¿Instalar ERPNext en el sitio?" y
-    yesno SETUP_PRODUCTION "¿Configurar producción (nginx + supervisor + fail2ban)?" y
-    SETUP_SSL=${SETUP_SSL:-no}
+    yesno INSTALL_ERPNEXT "¿Instalar también ERPNext en el sitio?" n
+    yesno SETUP_PRODUCTION "¿Configurar ya la producción (nginx + supervisor + fail2ban)? Si no, queda para después" n
     if [[ $SETUP_PRODUCTION == yes ]]; then
-        yesno SETUP_SSL "¿Pedir certificado SSL de Let's Encrypt? (el DNS debe apuntar ya a este servidor y el puerto 80 estar abierto)" n
+        yesno SETUP_SSL "¿Pedir certificado SSL de Let's Encrypt? (el DNS ya debe apuntar a este servidor y el puerto 80 estar abierto)" n
+    else
+        flag SETUP_SSL
+        [[ $SETUP_SSL != yes ]] || warn "SETUP_SSL=yes se ignora: no se configura producción ahora."
+        SETUP_SSL=no
     fi
 
     if [[ -z "${FRAPPE_DB_ROOT_PASSWORD:-}" ]]; then
@@ -219,17 +265,25 @@ EOF
     sudo apt-get update
 }
 
+# Todo lo que 'bench setup production' necesita, instalado ya aunque la
+# producción se configure después. Con estos binarios presentes, bench no
+# intenta 'pip install ansible' (falla con bench instalado por uv) ni sus roles.
+# Solo se instalan; la configuración de nginx/supervisor la hace el modo
+# "production" (o SETUP_PRODUCTION=yes).
+PROD_PACKAGES=(nginx supervisor fail2ban ansible-core acl certbot)
+
 install_packages() {
-    info "Instalando paquetes del sistema..."
+    info "Instalando paquetes del sistema (incluye los de producción)..."
     # redis-server: si la distro no lo trae, mejor parar que improvisar.
     local redis_cand
     redis_cand=$(apt-cache policy redis-server 2>/dev/null | awk '/Candidate:/ {print $2}')
     [[ -n "$redis_cand" && "$redis_cand" != "(none)" ]] \
         || die "No hay paquete redis-server en esta distro. Instala Redis/Valkey a mano y vuelve a ejecutar."
 
-    apt_install git curl ca-certificates gnupg build-essential pkg-config cron acl \
+    apt_install git curl ca-certificates gnupg build-essential pkg-config cron \
         redis-server mariadb-server mariadb-client libmariadb-dev \
-        fontconfig libxrender1 xfonts-75dpi xfonts-base xvfb libfontconfig
+        fontconfig libxrender1 xfonts-75dpi xfonts-base xvfb libfontconfig \
+        "${PROD_PACKAGES[@]}"
 }
 
 install_wkhtmltopdf() {
@@ -328,6 +382,28 @@ install_python_and_bench() {
     ok "bench $(bench --version), Python en ${PYBIN}"
 }
 
+# Un script no puede cambiar el PATH de la shell que lo lanzó, pero sí dejar
+# las sesiones futuras bien configuradas (uv instala bench en ~/.local/bin).
+persist_path() {
+    info "Dejando bench y node en el PATH de las próximas sesiones..."
+    local marker="# >>> frappe_install_v16 >>>" end="# <<< frappe_install_v16 <<<" f
+    for f in "$HOME/.profile" "$HOME/.bashrc"; do
+        touch "$f"
+        if grep -qF "$marker" "$f"; then
+            continue
+        fi
+        {
+            printf '\n%s\n' "$marker"
+            printf '%s\n' 'case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) export PATH="$HOME/.local/bin:$PATH" ;; esac'
+            if ! grep -q 'nvm\.sh' "$f"; then
+                printf '%s\n' 'export NVM_DIR="$HOME/.nvm"' '[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"'
+            fi
+            printf '%s\n' "$end"
+        } >> "$f"
+    done
+    ok "PATH persistente en ~/.profile y ~/.bashrc"
+}
+
 init_bench() {
     BENCH_DIR="$HOME/$BENCH_NAME"
     if [[ -d "$BENCH_DIR/apps/frappe" ]]; then
@@ -383,11 +459,9 @@ grant_nginx_access() {
 }
 
 setup_production() {
-    info "Instalando nginx, supervisor, fail2ban y ansible-core..."
-    # Con estos binarios ya presentes, 'bench setup production' no intenta
-    # 'pip install ansible' (que falla con bench instalado por uv) ni lanzar
-    # sus roles de ansible.
-    apt_install nginx supervisor fail2ban ansible-core
+    # Normalmente ya están (install_packages); esto cubre una instalación
+    # previa hecha con una versión anterior del script. Es idempotente.
+    apt_install "${PROD_PACKAGES[@]}"
     grant_nginx_access
 
     cd "$BENCH_DIR"
@@ -399,7 +473,6 @@ setup_production() {
 
     if [[ $SETUP_SSL == yes ]]; then
         info "Configurando SSL con Let's Encrypt (parará nginx unos segundos)."
-        apt_install certbot
         bench config dns_multitenant on
         sudo -H env "PATH=$PATH:/usr/sbin:/sbin" bench setup lets-encrypt "$SITE_NAME"
     fi
@@ -421,21 +494,118 @@ summary() {
         echo "     sudo ufw allow OpenSSH && sudo ufw allow 80/tcp && sudo ufw allow 443/tcp && sudo ufw enable"
     else
         echo "  Arranca el entorno de desarrollo con: cd $BENCH_DIR && bench start"
+        echo
+        echo "  Producción: los paquetes (nginx, supervisor, fail2ban, ansible-core, certbot)"
+        echo "  ya están instalados, pero NO hay nada configurado. Cuando quieras:"
+        echo "     bash $0 production            # nginx + supervisor, sin SSL"
+        echo "     SETUP_SSL=yes bash $0 production   # además Let's Encrypt (DNS apuntando aquí y puerto 80 abierto)"
+        echo "  Usa siempre ese modo en vez de 'bench setup production' a mano: aplica los"
+        echo "  permisos mínimos para que nginx lea /assets y /files (si no, dará 403)."
     fi
     echo
-    echo "  Abre una terminal nueva (o 'source ~/.bashrc') para tener nvm y bench en el PATH."
+    echo "  Para tener bench y node en ESTA terminal ahora mismo:  exec bash -l"
+    echo "  (las sesiones nuevas ya los llevan en el PATH)."
     echo "  Contraseñas: no se guardan en ningún fichero de este script."
 }
 
+# Para después de la instalación: configura solo la producción de un bench ya
+# creado. Reutiliza los paquetes instalados y aplica las ACL de nginx.
+load_nvm() {
+    export NVM_DIR="$HOME/.nvm"
+    [[ -s "$NVM_DIR/nvm.sh" ]] || die "No encuentro nvm en $NVM_DIR: ¿se hizo la instalación base?"
+    trap - ERR
+    set +eu
+    # shellcheck disable=SC1091
+    . "$NVM_DIR/nvm.sh"
+    nvm use default >/dev/null 2>&1
+    set -eu
+    trap 'on_err "$LINENO" "$?"' ERR
+    command -v node >/dev/null || die "Node no está disponible tras cargar nvm."
+}
+
+production_only() {
+    preflight
+    ask_bench_and_site
+    SETUP_PRODUCTION=yes
+    yesno SETUP_SSL "¿Pedir también certificado SSL de Let's Encrypt? (el DNS ya debe apuntar a este servidor y el puerto 80 estar abierto)" n
+
+    export PATH="$HOME/.local/bin:$PATH"
+    command -v bench >/dev/null || die "No encuentro 'bench' en ~/.local/bin. ¿Se hizo la instalación base?"
+    load_nvm
+
+    BENCH_DIR="$HOME/$BENCH_NAME"
+    [[ -d "$BENCH_DIR/apps/frappe" ]] || die "No existe un bench en $BENCH_DIR."
+    [[ -d "$BENCH_DIR/sites/$SITE_NAME" ]] || die "No existe el sitio $SITE_NAME en $BENCH_DIR/sites."
+
+    echo
+    info "Se va a configurar la producción"
+    echo "  Bench:  $BENCH_DIR"
+    echo "  Sitio:  $SITE_NAME"
+    echo "  SSL:    $SETUP_SSL"
+    echo "  Hará:   permisos mínimos para nginx, bench setup production, scheduler$([[ $SETUP_SSL == yes ]] && echo ', Let'"'"'s Encrypt')"
+    confirm_go "¿Continuar?"
+
+    setup_production
+    summary
+}
+
+# Resumen de lo elegido y confirmación antes de tocar el sistema.
+confirm_plan() {
+    echo
+    info "Resumen de lo que se va a hacer"
+    echo "  Usuario:      $RUN_USER   ($OS_ID $OS_VER, $ARCH)"
+    echo "  Frappe:       $FRAPPE_BRANCH en ~/$BENCH_NAME"
+    echo "  Sitio:        $SITE_NAME"
+    echo "  ERPNext:      $INSTALL_ERPNEXT"
+    echo "  Producción:   $SETUP_PRODUCTION (SSL: $SETUP_SSL)"
+    echo "  Versiones:    MariaDB $MARIADB_VERSION, Node $NODE_MAJOR, Python $PY_VERSION"
+    echo "  Sistema:      instala paquetes con sudo (también nginx, supervisor, fail2ban, certbot)"
+    confirm_go "¿Continuar con la instalación?"
+}
+
+choose_mode() {
+    {
+        echo
+        echo "  Frappe v16 — ¿qué quieres hacer?"
+        echo "    1) Instalación base de Frappe (deja listos los paquetes de producción)"
+        echo "    2) Configurar producción en un bench ya instalado"
+        echo "    3) Salir"
+    } >&2
+    local c
+    while true; do
+        read -rp "Elige [1-3]: " c || { echo quit; return 0; }
+        case "$c" in
+            1) echo install; return 0 ;;
+            2) echo production; return 0 ;;
+            3) echo quit; return 0 ;;
+        esac
+        echo "Opción no válida." >&2
+    done
+}
+
 main() {
+    local mode=${1:-}
+    if [[ -z "$mode" ]]; then
+        if [[ -t 0 ]]; then mode=$(choose_mode); else mode=install; fi
+    fi
+    case "$mode" in
+        install)    ;;
+        production) production_only; return 0 ;;
+        quit)       info "Hasta luego."; return 0 ;;
+        *) die "Uso: bash $0 [install|production]   (sin argumentos: menú)" ;;
+    esac
     preflight
     collect_inputs
+    confirm_plan
     setup_mariadb_repo
     install_packages
     install_wkhtmltopdf
     configure_mariadb
     install_node
     install_python_and_bench
+    # Justo tras instalar bench (no al final): así queda hecho aunque un paso
+    # posterior falle, p. ej. una contraseña mal escrita en 'bench new-site'.
+    persist_path
     init_bench
     create_site
     if [[ $SETUP_PRODUCTION == yes ]]; then
