@@ -76,9 +76,7 @@ sudo apt update && sudo apt full-upgrade -y
 ### 4. Descargar y ejecutar el script
 
 ```bash
-cd ~ && mkdir -p frappe_quick_install && cd frappe_quick_install
-# copia aquí frappe_install_v16.sh
-bash frappe_install_v16.sh
+git clone https://github.com/ct-Galega/frappe_quick_install.git
 ```
 
 Al terminar abre una shell nueva en la carpeta del bench con `bench` y `node` cargados. Si no se abrió:
