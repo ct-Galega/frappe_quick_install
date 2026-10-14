@@ -1,27 +1,26 @@
 #!/usr/bin/env bash
 #
-# frappe_install_v16.sh — Frappe v16 (bench) en Debian 13+ o Ubuntu 24.04+
+# frappe_install_v16.sh — Prepara un servidor para Frappe v16 (Debian 13+ / Ubuntu 24.04+)
 #
 # Uso (como usuario NORMAL con sudo, nunca como root, y SIN "source"):
 #   bash frappe_install_v16.sh
 #
-# Solo instala el bench. NO crea sitios, ni instala ERPNext, ni configura la
-# producción: eso se hace después a mano (el resumen final dice cómo).
+# NO crea ningún bench ni sitio: el bench lo creas tú después con 'bench init'
+# (version-16, version-16-hotfix, develop...). El resumen final dice cómo.
 #
 # Qué hace (sigue la guía oficial de instalación de Frappe para v16):
 #   MariaDB 11.8 (repo oficial firmado solo si la distro no la trae), Redis,
 #   wkhtmltopdf con Qt parcheado (checksum fijado), Node 24 (nvm), Python 3.14
-#   y bench (uv), deja bench/nvm/node en el PATH (sesiones futuras, sudo y
-#   supervisor) y hace bench init. Deja instalado y preparado lo que la
-#   producción necesita: nginx, supervisor, fail2ban, ansible-core, certbot,
-#   acl, y los permisos (ACL) para que nginx lea los ficheros públicos.
+#   y bench (uv), y deja bench/nvm/node en el PATH (sesiones futuras, sudo y
+#   supervisor). Deja instalado lo que la producción necesita: nginx,
+#   supervisor, fail2ban, ansible-core, certbot, acl, y permite a nginx
+#   atravesar tu home (ACL) para que pueda servir los ficheros del bench.
 #
-# Pregunta (si la variable no está definida): BENCH_NAME, DB_ADMIN_USER (usuario
+# Pregunta (si la variable no está definida): DB_ADMIN_USER (usuario
 # administrador de MariaDB, por defecto root) y su contraseña
 # (FRAPPE_DB_PASSWORD), y pide confirmación final.
 # Otras variables:
 #   ASSUME_YES=1        omite la confirmación final
-#   FRAPPE_BRANCH       (version-16)
 #   ALLOW_UNSUPPORTED=1 distro/versión no probada
 #   NO_SHELL=1          no abrir una shell nueva al terminar (por defecto, en un
 #                       terminal, se abre una shell de login con bench y node)
@@ -38,7 +37,6 @@ fi
 set -Eeuo pipefail
 
 # --- Configuración ------------------------------------------------------------
-FRAPPE_BRANCH="${FRAPPE_BRANCH:-version-16}"
 MARIADB_VERSION="${MARIADB_VERSION:-11.8}"
 NODE_MAJOR="${NODE_MAJOR:-24}"
 NVM_VERSION="${NVM_VERSION:-v0.40.3}"
@@ -183,15 +181,7 @@ preflight() {
 
 # --- Datos de entrada ---------------------------------------------------------
 collect_inputs() {
-    # En un terminal, si un nombre no es válido se vuelve a preguntar.
-    while true; do
-        ask BENCH_NAME "Nombre del bench (carpeta en tu home)" "frappe-bench"
-        [[ "$BENCH_NAME" =~ ^[A-Za-z0-9._-]+$ ]] && break
-        [[ -t 0 ]] || die "Nombre de bench no válido: solo letras, números, '.', '_' y '-'."
-        warn "Nombre de bench no válido: solo letras, números, '.', '_' y '-'."
-        BENCH_NAME=""
-    done
-
+    # En un terminal, si el nombre no es válido se vuelve a preguntar.
     while true; do
         ask DB_ADMIN_USER "Usuario administrador de MariaDB (el que usará 'bench new-site')" "root"
         [[ "$DB_ADMIN_USER" =~ ^[A-Za-z0-9_]{1,32}$ ]] && break
@@ -451,38 +441,18 @@ setup_sudo_path() {
     fi
 }
 
-init_bench() {
-    BENCH_DIR="$HOME/$BENCH_NAME"
-    if [[ -d "$BENCH_DIR/apps/frappe" ]]; then
-        warn "Ya existe $BENCH_DIR: lo reutilizo."
-        return 0
-    fi
-    info "bench init ($FRAPPE_BRANCH)... esto tarda unos minutos."
-    cd "$HOME"
-    bench init "$BENCH_NAME" --frappe-branch "$FRAPPE_BRANCH" --python "$PYBIN" --verbose
-}
-
 # --- Preparación para producción ----------------------------------------------
-grant_nginx_access() {
-    # nginx sirve /assets y /files desde dentro de tu home. En vez de abrir el
-    # home a todo el mundo (chmod -R o+rx), se da acceso solo al usuario de
-    # nginx y solo a lo público; sites/<sitio>/private y site_config.json NO.
+# nginx sirve /assets y /files desde dentro del bench, que está en tu home, y el
+# home es privado por defecto (700/750). En vez de abrirlo a todo el mundo
+# (chmod o+rx), se permite solo a nginx atravesarlo (x, sin listar ni leer).
+allow_nginx_home() {
     local ng_user
     ng_user=$(awk '$1=="user" {gsub(/;/,"",$2); print $2; exit}' /etc/nginx/nginx.conf 2>/dev/null || true)
     ng_user=${ng_user:-www-data}
     id "$ng_user" >/dev/null 2>&1 || die "No existe el usuario de nginx '$ng_user'."
-    NGINX_USER=$ng_user
-
-    info "Dando a '$ng_user' acceso de solo lectura a los ficheros públicos (ACL)..."
-    sudo setfacl -m "u:${ng_user}:x" "$HOME" "$BENCH_DIR" "$BENCH_DIR/sites"
-    # Los sitios que se creen después heredan el permiso de paso (x) en su carpeta.
-    sudo setfacl -d -m "u:${ng_user}:x" "$BENCH_DIR/sites"
-    local d
-    for d in "$BENCH_DIR/apps" "$BENCH_DIR/sites/assets"; do
-        [[ -d "$d" ]] || continue
-        sudo setfacl -R -m "u:${ng_user}:rX" "$d"
-        sudo setfacl -R -d -m "u:${ng_user}:rX" "$d"
-    done
+    info "Permitiendo a '$ng_user' atravesar tu home (ACL, sin leer su contenido)..."
+    sudo setfacl -m "u:${ng_user}:x" "$HOME"
+    ok "'$ng_user' puede atravesar $HOME"
 }
 
 link_node_system() {
@@ -501,25 +471,23 @@ link_node_system() {
 
 summary() {
     echo
-    ok "Instalación terminada."
-    echo "  Bench:               $BENCH_DIR"
+    ok "Servidor listo. No se ha creado ningún bench ni sitio."
     echo "  Admin de MariaDB:    $DB_ADMIN_USER"
     echo
-    echo "  Siguientes pasos (no se ha creado ningún sitio):"
-    echo "    cd $BENCH_DIR"
-    echo "    bench new-site SITIO --db-root-username $DB_ADMIN_USER     # pide la contraseña de MariaDB y la del Administrator"
-    echo "    bench get-app erpnext --branch $FRAPPE_BRANCH && bench --site SITIO install-app erpnext    # opcional"
-    echo "    bench use SITIO && bench start                             # desarrollo"
+    echo "  1) Crear el bench (elige la rama):"
+    echo "       bench init --frappe-branch version-16 --python \"\$(uv python find $PY_VERSION)\" --verbose NOMBRE"
+    echo "       # otras ramas: version-16-hotfix, develop (develop puede pedir otras versiones de Python/Node)"
+    echo "  2) Crear el sitio, activar multitenancy DNS y producción:"
+    echo "       cd ~/NOMBRE"
+    echo "       bench new-site SITIO --db-root-username $DB_ADMIN_USER"
+    echo "       bench config dns_multitenant on"
+    echo "       sudo bench setup production $RUN_USER --yes"
     echo
-    echo "  Producción (ya está todo instalado y los permisos preparados):"
-    echo "    for d in sites/*/public; do sudo setfacl -R -m u:${NGINX_USER:-www-data}:rX \"\$d\"; sudo setfacl -R -d -m u:${NGINX_USER:-www-data}:rX \"\$d\"; done"
-    echo "    sudo bench setup production $RUN_USER --yes"
-    echo "  (la primera línea da a nginx acceso a los ficheros públicos de los sitios creados)"
     echo "  Firewall (no lo toco por si te dejara fuera). Si usas ufw:"
     echo "    sudo ufw allow OpenSSH && sudo ufw allow 80/tcp && sudo ufw allow 443/tcp && sudo ufw enable"
     echo
     if will_open_shell; then
-        echo "  Al terminar se abre una shell nueva (en $BENCH_DIR) con bench y node ya cargados."
+        echo "  Al terminar se abre una shell nueva con bench y node ya cargados."
         echo "  Escribe 'exit' para volver a la anterior. Las sesiones SSH nuevas ya los llevan."
     else
         echo "  Para tener bench y node en ESTA terminal ahora mismo:  exec bash -l"
@@ -552,11 +520,10 @@ confirm_plan() {
     echo
     info "Resumen de lo que se va a hacer"
     echo "  Usuario:      $RUN_USER   ($OS_ID $OS_VER, $ARCH)"
-    echo "  Frappe:       $FRAPPE_BRANCH en ~/$BENCH_NAME (sin sitios)"
     echo "  MariaDB:      usuario administrador '$DB_ADMIN_USER'"
     echo "  Versiones:    MariaDB $MARIADB_VERSION, Node $NODE_MAJOR, Python $PY_VERSION"
     echo "  Sistema:      instala paquetes con sudo (también nginx, supervisor, fail2ban, certbot)"
-    echo "                y prepara permisos para producción; NO configura producción"
+    echo "  Bench/sitio:  NO se crean (los creas tú después)"
     confirm_go "¿Continuar con la instalación?"
 }
 
@@ -576,11 +543,10 @@ main() {
     # posterior falle.
     persist_path
     setup_sudo_path
-    init_bench
-    grant_nginx_access
+    allow_nginx_home
     link_node_system
     summary
-    enter_fresh_shell "$BENCH_DIR"
+    enter_fresh_shell "$HOME"
 }
 
 main "$@"
