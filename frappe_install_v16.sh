@@ -431,6 +431,37 @@ persist_path() {
     ok "PATH persistente en ~/.profile y ~/.bashrc"
 }
 
+# 'sudo bench ...' falla con "command not found" porque sudo usa su propio PATH
+# (secure_path) y no ve ~/.local/bin. No es solo cosmético: 'bench setup
+# production' ejecuta which("node") bajo sudo, y sin node visible omite el
+# programa de socketio de supervisor/systemd en silencio (sin tiempo real).
+# Se añade ~/.local/bin AL FINAL del secure_path de este usuario: lo del sistema
+# siempre tiene prioridad, así que no puede tapar comandos como apt o ls.
+setup_sudo_path() {
+    local dir="${SUDOERS_DIR:-/etc/sudoers.d}"
+    if [[ ! -d "$dir" ]] || ! command -v visudo >/dev/null; then
+        warn "No puedo configurar el PATH de sudo (falta $dir o visudo). Usa: sudo env \"PATH=\$PATH\" bench ..."
+        return 0
+    fi
+    local cur tmp file="$dir/${RUN_USER}-bench-path"
+    cur=$(sudo sh -c 'printf %s "$PATH"') || true
+    if [[ -z "$cur" ]]; then
+        warn "No pude leer el PATH de sudo; no toco la configuración. Usa: sudo env \"PATH=\$PATH\" bench ..."
+        return 0
+    fi
+    case ":$cur:" in
+        *":$HOME/.local/bin:"*) ok "sudo ya ve ~/.local/bin (sudo bench funciona)."; return 0 ;;
+    esac
+    tmp="$WORKDIR/sudo-path"
+    printf 'Defaults:%s secure_path="%s:%s/.local/bin"\n' "$RUN_USER" "$cur" "$HOME" > "$tmp"
+    if visudo -cf "$tmp" >/dev/null 2>&1; then
+        sudo install -m 0440 "$tmp" "$file"
+        ok "sudo ve ahora ~/.local/bin (al final de su PATH): 'sudo bench ...' y node funcionan. Regla: $file"
+    else
+        warn "visudo rechazó la regla; no la instalo. Usa: sudo env \"PATH=\$PATH\" bench ..."
+    fi
+}
+
 init_bench() {
     BENCH_DIR="$HOME/$BENCH_NAME"
     if [[ -d "$BENCH_DIR/apps/frappe" ]]; then
@@ -568,7 +599,7 @@ load_nvm() {
     set +eu
     # shellcheck disable=SC1091
     . "$NVM_DIR/nvm.sh"
-    nvm use default >/dev/null 2>&1
+    nvm use default >/dev/null 2>&1 || nvm use "$NODE_MAJOR" >/dev/null 2>&1
     set -eu
     trap 'on_err "$LINENO" "$?"' ERR
     command -v node >/dev/null || die "Node no está disponible tras cargar nvm."
@@ -584,6 +615,7 @@ production_only() {
     command -v bench >/dev/null || die "No encuentro 'bench' en ~/.local/bin. ¿Se hizo la instalación base?"
     load_nvm
     link_node_tools
+    setup_sudo_path
 
     BENCH_DIR="$HOME/$BENCH_NAME"
     [[ -d "$BENCH_DIR/apps/frappe" ]] || die "No existe un bench en $BENCH_DIR."
@@ -660,6 +692,7 @@ main() {
     # Justo tras instalar bench (no al final): así queda hecho aunque un paso
     # posterior falle, p. ej. una contraseña mal escrita en 'bench new-site'.
     persist_path
+    setup_sudo_path
     init_bench
     create_site
     if [[ $SETUP_PRODUCTION == yes ]]; then
