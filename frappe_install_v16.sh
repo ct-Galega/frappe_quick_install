@@ -516,11 +516,26 @@ grant_nginx_access() {
     done
 }
 
+link_node_system() {
+    # supervisor arranca los procesos con el PATH del sistema (sin ~/.local/bin
+    # ni nvm): sin esto, socketio falla con "node not found" (spawn error).
+    local node dst=/usr/local/bin/node
+    node=$(readlink -f "$(command -v node 2>/dev/null)" 2>/dev/null || true)
+    [[ -n "$node" && -x "$node" ]] || { warn "No encuentro node: socketio no arrancará en producción."; return 0; }
+    if [[ -e "$dst" && ! -L "$dst" ]]; then
+        warn "$dst ya existe y no es un enlace: no lo toco."
+        return 0
+    fi
+    sudo ln -sfn "$node" "$dst"
+    ok "node visible para supervisor: $dst -> $node"
+}
+
 setup_production() {
     # Normalmente ya están (install_packages); esto cubre una instalación
     # previa hecha con una versión anterior del script. Es idempotente.
     apt_install "${PROD_PACKAGES[@]}"
     grant_nginx_access
+    link_node_system
 
     cd "$BENCH_DIR"
     info "bench setup production..."
@@ -695,6 +710,10 @@ main() {
     setup_sudo_path
     init_bench
     create_site
+    # Siempre, aunque la producción se configure después (incluso a mano con
+    # "sudo bench setup production"): permisos de nginx y node para supervisor.
+    grant_nginx_access
+    link_node_system
     if [[ $SETUP_PRODUCTION == yes ]]; then
         setup_production
     fi

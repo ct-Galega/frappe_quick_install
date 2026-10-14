@@ -99,6 +99,8 @@ Un script no puede cambiar el `PATH` de la terminal que lo lanzó. Por eso:
 
 - Añade un bloque con el `PATH` y nvm a `~/.profile` y `~/.bashrc`.
 - Enlaza `node`, `npm`, `npx` y `yarn` en `~/.local/bin`.
+- Enlaza `node` en `/usr/local/bin` para que supervisor lo vea (si no, socketio falla con `spawn error`).
+- Da a nginx acceso de solo lectura (ACL) a `apps`, `sites/assets` y `public`, para que cargue el CSS aunque la producción se configure después a mano.
 - Crea `/etc/sudoers.d/<usuario>-bench-path`, que añade `~/.local/bin` al final del `secure_path` de sudo
   (validado con `visudo`). Así funcionan `sudo bench ...` y `node` bajo sudo (necesario para socketio en producción).
 - Al terminar abre una shell de login nueva en la carpeta del bench. Si no se abrió, ejecuta `exec bash -l`.
@@ -188,10 +190,11 @@ Logs: `~/<bench>/logs/` y `/var/log/nginx/`.
 |---|---|
 | `bench: command not found` | Shell sin el PATH cargado: `exec bash -l` |
 | `sudo: bench: command not found` | Falta la regla de sudoers: ejecuta `bash frappe_install_v16.sh production` o usa `sudo env "PATH=$PATH" bench ...` |
-| `Cannot start socketio: node not found` | nvm no cargado en la shell: `exec bash -l` |
+| `Cannot start socketio: node not found` (en `bench start`) | nvm no cargado en la shell: `exec bash -l` |
+| `Cannot start socketio: node not found` (supervisor, `spawn error`) | supervisor no ve node: `sudo ln -sfn "$(readlink -f "$(command -v node)")" /usr/local/bin/node && sudo supervisorctl restart all` (el script ya lo hace) |
 | MariaDB error 1698 (`Access denied for user 'root'@'localhost'`) | root usa unix_socket; el script deja contraseña de root, usa `--db-root-password` |
 | 502 en nginx | Revisa `sudo supervisorctl status` y `~/<bench>/logs/web.error.log` |
-| Estilos o imágenes no cargan | `bench build`, y comprueba permisos (`namei -l ~/<bench>/sites/assets`) |
+| Sin CSS ni imágenes | nginx (`www-data`) no puede leer el bench. El script da acceso por ACL; si falta, repite `bash frappe_install_v16.sh production` o `sudo setfacl` (ver el script, `grant_nginx_access`). Comprueba con `sudo -u www-data test -r ~/<bench>/sites/assets/frappe` y `/var/log/nginx/error.log` |
 
 ## Estado de las pruebas
 
