@@ -22,6 +22,13 @@
 # Para saltarse preguntas, define la variable; ASSUME_YES=1 omite la confirmación.
 # Otras variables:
 #   FRAPPE_BRANCH (version-16)   ALLOW_UNSUPPORTED=1 (distro/versión no probada)
+#   NO_SHELL=1  no abrir una shell nueva al terminar (por defecto, en un terminal,
+#               se abre una shell de login con bench y node ya cargados)
+#
+# PATH y node: deja bench/nvm en ~/.profile y ~/.bashrc, enlaza node, npm, npx y
+# yarn en ~/.local/bin (valen aunque nvm no esté cargado) y, al terminar, abre
+# una shell nueva en la carpeta del bench. Un script no puede cambiar el PATH
+# de la terminal que lo lanzó; por eso la shell nueva.
 #
 # Contraseñas: la de root de MariaDB se pide aquí (oculta) y se pasa a MariaDB
 # por stdin, nunca por la línea de comandos. La del Administrator del sitio y
@@ -367,6 +374,26 @@ install_node() {
     ok "Node $(node -v), yarn $(yarn -v)"
 }
 
+# nvm solo existe en las shells que lo cargan. Enlazar node/npm/npx/yarn en
+# ~/.local/bin (que ya está en el PATH por bench) hace que bench start, bench
+# build y yarn funcionen en cualquier sesión, aunque nvm no esté cargado.
+link_node_tools() {
+    mkdir -p "$HOME/.local/bin"
+    local t src dst linked=()
+    for t in node npm npx yarn; do
+        src=$(command -v "$t" 2>/dev/null || true)
+        dst="$HOME/.local/bin/$t"
+        [[ -n "$src" && "$src" != "$dst" ]] || continue
+        if [[ -e "$dst" && ! -L "$dst" ]]; then
+            warn "$dst ya existe y no es un enlace: no lo toco."
+            continue
+        fi
+        ln -sfn "$src" "$dst"
+        linked+=("$t")
+    done
+    [[ ${#linked[@]} -eq 0 ]] || ok "Enlazados en ~/.local/bin: ${linked[*]} (funcionan aunque nvm no esté cargado)"
+}
+
 install_python_and_bench() {
     info "Instalando uv, Python ${PY_VERSION} y bench..."
     export PATH="$HOME/.local/bin:$PATH"
@@ -503,9 +530,33 @@ summary() {
         echo "  permisos mínimos para que nginx lea /assets y /files (si no, dará 403)."
     fi
     echo
-    echo "  Para tener bench y node en ESTA terminal ahora mismo:  exec bash -l"
-    echo "  (las sesiones nuevas ya los llevan en el PATH)."
+    if will_open_shell; then
+        echo "  Al terminar se abre una shell nueva (en $BENCH_DIR) con bench y node ya cargados."
+        echo "  Escribe 'exit' para volver a la anterior. Las sesiones SSH nuevas ya los llevan."
+    else
+        echo "  Para tener bench y node en ESTA terminal ahora mismo:  exec bash -l"
+        echo "  (las sesiones nuevas ya los llevan en el PATH)."
+    fi
     echo "  Contraseñas: no se guardan en ningún fichero de este script."
+}
+
+# Un script no puede cambiar el PATH de la terminal que lo lanzó. Lo más cercano
+# a "automático": sustituir el proceso del script por una shell de login nueva,
+# que lee ~/.profile (PATH + nvm) y deja al usuario en la carpeta del bench.
+will_open_shell() { [[ -t 0 && -t 1 && "${NO_SHELL:-}" != 1 ]]; }
+
+enter_fresh_shell() {
+    will_open_shell || return 0
+    local dir=${1:-$HOME}
+    [[ -d "$dir" ]] || dir=$HOME
+    echo
+    info "Abriendo una shell nueva con bench y node cargados (escribe 'exit' para volver a la anterior)..."
+    # 'exec' no ejecuta el trap EXIT: limpiar a mano (temporales y el proceso
+    # que mantenía vivo sudo, que de otro modo seguiría con el PID de la shell).
+    cleanup
+    trap - EXIT ERR
+    cd "$dir"
+    exec bash -l
 }
 
 # Para después de la instalación: configura solo la producción de un bench ya
@@ -532,6 +583,7 @@ production_only() {
     export PATH="$HOME/.local/bin:$PATH"
     command -v bench >/dev/null || die "No encuentro 'bench' en ~/.local/bin. ¿Se hizo la instalación base?"
     load_nvm
+    link_node_tools
 
     BENCH_DIR="$HOME/$BENCH_NAME"
     [[ -d "$BENCH_DIR/apps/frappe" ]] || die "No existe un bench en $BENCH_DIR."
@@ -547,6 +599,7 @@ production_only() {
 
     setup_production
     summary
+    enter_fresh_shell "$BENCH_DIR"
 }
 
 # Resumen de lo elegido y confirmación antes de tocar el sistema.
@@ -602,6 +655,7 @@ main() {
     install_wkhtmltopdf
     configure_mariadb
     install_node
+    link_node_tools
     install_python_and_bench
     # Justo tras instalar bench (no al final): así queda hecho aunque un paso
     # posterior falle, p. ej. una contraseña mal escrita en 'bench new-site'.
@@ -612,6 +666,7 @@ main() {
         setup_production
     fi
     summary
+    enter_fresh_shell "$BENCH_DIR"
 }
 
 main "$@"
